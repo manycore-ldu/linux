@@ -41,6 +41,7 @@
 #include <linux/notifier.h>
 #include <linux/memory.h>
 #include <linux/printk.h>
+#include <linux/kthread.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/moduleparam.h>
 
@@ -76,6 +77,266 @@ core_param(ignore_rlimit_data, ignore_rlimit_data, bool, 0644);
 static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
 		unsigned long start, unsigned long end);
+
+#define LDU_UPDATE_RATE 1 /* 1 sec */
+static struct workqueue_struct *i_mmap_wq;
+static struct task_struct *free_vma_task;
+
+#define I_MMAP_HASH_ORDER	11
+#define I_MMAP_HASH_SIZE (1 << I_MMAP_HASH_ORDER)
+
+struct pldu_deferred_i_mmap {
+	struct llist_head list;
+};
+
+struct i_mmap_slot {
+	struct pldu_deferred_i_mmap mapping[1 << I_MMAP_HASH_ORDER];
+};
+
+static DEFINE_PER_CPU(struct i_mmap_slot, i_mmap_slot);
+static DEFINE_PER_CPU(struct llist_head, pldu_vma_clean);
+
+
+void synchronize_ldu_i_mmap_internal(struct llist_node *entry);
+void synchronize_ldu_i_mmap(struct address_space *mapping);
+
+void i_mmap_free_work_func(struct work_struct *work);
+
+bool i_mmap_ldu_logical_update(struct address_space *mapping,
+		struct ldu_node *dnode)
+{
+	struct pldu_deferred_i_mmap *p;
+	struct i_mmap_slot *slot;
+	struct llist_node *first;
+	struct llist_node *entry;
+	struct ldu_node *ldu;
+	struct address_space *locked_mapping = NULL;
+
+	slot = &get_cpu_var(i_mmap_slot);
+	p = &slot->mapping[hash_ptr(mapping, I_MMAP_HASH_ORDER)];
+	first = READ_ONCE(p->list.first);
+	if (first) {
+		ldu = llist_entry(first, struct ldu_node, ll_node);
+		if (READ_ONCE(ldu->root) != READ_ONCE(dnode->root)) {
+			locked_mapping = READ_ONCE(ldu->key2);
+			entry = llist_del_all(&p->list);
+			llist_add(&dnode->ll_node, &p->list);
+			put_cpu_var(i_mmap_slot);
+			down_write(&locked_mapping->i_mmap_rwsem);
+			if (entry) {
+				synchronize_ldu_i_mmap_internal(entry);
+			}
+			up_write(&locked_mapping->i_mmap_rwsem);
+			goto out;
+		}
+	}
+
+	llist_add(&dnode->ll_node, &p->list);
+	put_cpu_var(i_mmap_slot);
+
+out:
+	return true;
+}
+
+bool i_mmap_ldu_logical_insert(struct vm_area_struct *obj,
+		struct address_space *head)
+{
+	struct ldu_node *add_dnode = &obj->dnode.node[0];
+	struct ldu_node *del_dnode = &obj->dnode.node[1];
+
+	/* Phase 1 : update-side removing logs */
+	if (!xchg(&del_dnode->mark, 0)) {
+		BUG_ON(add_dnode->mark);
+		WRITE_ONCE(add_dnode->mark, 1);
+		/* Phase 2 : reusing garbage log */
+		if (!test_and_set_bit(LDU_OP_ADD, &obj->dnode.used)) {
+			add_dnode->op_num = LDU_OP_ADD;
+			add_dnode->key = obj;
+			add_dnode->key2 = head;
+			add_dnode->root = &head->i_mmap;
+			/* Phase 3(slow-path): insert log to queue */
+			i_mmap_ldu_logical_update(head, add_dnode);
+		}
+	}
+
+	return true;
+}
+
+bool i_mmap_ldu_logical_remove(struct vm_area_struct *obj,
+		struct address_space *head)
+{
+	struct ldu_node *add_dnode = &obj->dnode.node[0];
+	struct ldu_node *del_dnode = &obj->dnode.node[1];
+
+	/* Phase 1 : update-side removing logs */
+	if (!xchg(&add_dnode->mark, 0)) {
+		BUG_ON(del_dnode->mark);
+		WRITE_ONCE(del_dnode->mark, 1);
+		/* Phase 2 : reusing garbage log */
+		if (!test_and_set_bit(LDU_OP_DEL, &obj->dnode.used)) {
+			del_dnode->op_num = LDU_OP_DEL;
+			del_dnode->key = obj;
+			del_dnode->key2 = head;
+			del_dnode->root = &head->i_mmap;
+			/* Phase 3(slow-path): insert log to queue */
+			i_mmap_ldu_logical_update(head, del_dnode);
+		}
+	}
+
+	return true;
+}
+
+void i_mmap_ldu_physical_update(int op, struct vm_area_struct *vma,
+		struct rb_root *root)
+{
+	if (!root)
+		return;
+
+	if (op == LDU_OP_ADD)
+		vma_interval_tree_insert(vma, root);
+	else
+		vma_interval_tree_remove(vma, root);
+}
+
+void synchronize_ldu_i_mmap_internal(struct llist_node *entry)
+{
+	struct ldu_node *dnode;
+	struct vm_area_struct *vma;
+
+	/* iteration all logs */
+	llist_for_each_entry(dnode, entry, ll_node) {
+		vma = READ_ONCE(dnode->key);
+		/* atomic swap due to update-side removing */
+		if (xchg(&dnode->mark, 0)) {
+			i_mmap_ldu_physical_update(dnode->op_num, vma,
+					READ_ONCE(dnode->root));
+		}
+		clear_bit(dnode->op_num, &vma->dnode.used);
+		/* once again check due to reusing garbage logs */
+		if (xchg(&dnode->mark, 0)) {
+			i_mmap_ldu_physical_update(dnode->op_num, vma,
+					READ_ONCE(dnode->root));
+		}
+	}
+}
+
+void synchronize_ldu_i_mmap(struct address_space *mapping)
+{
+	int cpu;
+	struct i_mmap_slot *slot;
+	struct pldu_deferred_i_mmap *p;
+	struct llist_node *entry;
+	struct llist_node *first;
+	struct ldu_node *ldu;
+
+	for_each_possible_cpu(cpu) {
+		slot = &per_cpu(i_mmap_slot, cpu);
+		p = &slot->mapping[hash_ptr(mapping, I_MMAP_HASH_ORDER)];
+		first = READ_ONCE(p->list.first);
+		if (first) {
+			ldu = llist_entry(first, struct ldu_node, ll_node);
+			if (ldu && ldu->root != &mapping->i_mmap) {
+				continue;
+			}
+		} else
+			continue;
+
+		entry = llist_del_all(&p->list);
+		if (!entry)
+			continue;
+
+		synchronize_ldu_i_mmap_internal(entry);
+	}
+}
+EXPORT_SYMBOL_GPL(synchronize_ldu_i_mmap);
+
+void free_vma(struct vm_area_struct *vma)
+{
+	struct file *file = vma->vm_file;
+
+	if (file && READ_ONCE(vma->dnode.used)) {
+		struct llist_head *ll = this_cpu_ptr(&pldu_vma_clean);
+		llist_add(&vma->llist, ll);
+		return;
+	}
+	kmem_cache_free(vm_area_cachep, vma);
+}
+
+void clean_percore_mapping(struct address_space *mapping)
+{
+	int cpu;
+	struct i_mmap_slot *slot;
+	struct pldu_deferred_i_mmap *p;
+	struct llist_node *entry;
+	struct llist_node *first;
+	struct ldu_node *ldu;
+
+	for_each_possible_cpu(cpu) {
+		slot = &per_cpu(i_mmap_slot, cpu);
+		p = &slot->mapping[hash_ptr(mapping, I_MMAP_HASH_ORDER)];
+		first = READ_ONCE(p->list.first);
+		if (first) {
+			ldu = llist_entry(first, struct ldu_node, ll_node);
+			if (ldu && ldu->root != &mapping->i_mmap)
+				continue;
+		} else
+			continue;
+		entry = llist_del_all(&p->list);
+		if (!entry)
+			continue;
+
+		synchronize_ldu_i_mmap_internal(entry);
+	}
+}
+
+static struct llist_node *free_entry[NR_CPUS];
+
+static int free_vma_thread(void *dummy)
+{
+	struct vm_area_struct *vnode, *vnext;
+	int cpu, i;
+	struct i_mmap_slot *slot;
+	struct llist_node *entry;
+	struct llist_head *ll;
+	struct address_space *locked_mapping = NULL;
+	struct ldu_node *ldu;
+
+	while (!kthread_should_stop()) {
+		schedule_timeout_interruptible(HZ);
+
+		for_each_possible_cpu(cpu) {
+			ll = &per_cpu(pldu_vma_clean, cpu);
+			free_entry[cpu] = llist_del_all(ll);
+		}
+
+		for_each_possible_cpu(cpu) {
+			for (i = 0; i < I_MMAP_HASH_SIZE; i++) {
+				slot = &per_cpu(i_mmap_slot, cpu);
+				entry = llist_del_all(&slot->mapping[i].list);
+				if (!entry)
+					continue;
+				ldu = llist_entry(entry, struct ldu_node, ll_node);
+				locked_mapping = READ_ONCE(ldu->key2);
+				down_write(&locked_mapping->i_mmap_rwsem);
+				synchronize_ldu_i_mmap_internal(entry);
+				up_write(&locked_mapping->i_mmap_rwsem);
+			}
+		}
+
+		for_each_possible_cpu(cpu) {
+			ll = &per_cpu(pldu_vma_clean, cpu);
+			llist_for_each_entry_safe(vnode, vnext, free_entry[cpu], llist) {
+				if (!READ_ONCE(vnode->dnode.used)) {
+					kmem_cache_free(vm_area_cachep, vnode);
+				} else {
+					ll = this_cpu_ptr(&pldu_vma_clean);
+					llist_add(&vnode->llist, ll);
+				}
+			}
+		}
+	}
+	return 0;
+}
 
 /* description of effects of mapping type and prot in current implementation.
  * this is due to the limited x86 page protection hardware.  The expected
@@ -253,14 +514,15 @@ error:
 static void __remove_shared_vm_struct(struct vm_area_struct *vma,
 		struct file *file, struct address_space *mapping)
 {
+	flush_dcache_mmap_lock(mapping);
+	i_mmap_ldu_logical_remove(vma, mapping);
+	//vma_interval_tree_remove(vma, &mapping->i_mmap);
+	flush_dcache_mmap_unlock(mapping);
+
 	if (vma->vm_flags & VM_DENYWRITE)
 		atomic_inc(&file_inode(file)->i_writecount);
 	if (vma->vm_flags & VM_SHARED)
 		mapping_unmap_writable(mapping);
-
-	flush_dcache_mmap_lock(mapping);
-	vma_interval_tree_remove(vma, &mapping->i_mmap);
-	flush_dcache_mmap_unlock(mapping);
 }
 
 /*
@@ -273,9 +535,9 @@ void unlink_file_vma(struct vm_area_struct *vma)
 
 	if (file) {
 		struct address_space *mapping = file->f_mapping;
-		i_mmap_lock_write(mapping);
+		//i_mmap_lock_write(mapping);
 		__remove_shared_vm_struct(vma, file, mapping);
-		i_mmap_unlock_write(mapping);
+		//i_mmap_unlock_write(mapping);
 	}
 }
 
@@ -292,7 +554,7 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 	if (vma->vm_file)
 		fput(vma->vm_file);
 	mpol_put(vma_policy(vma));
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(vma);
 	return next;
 }
 
@@ -463,10 +725,11 @@ static void validate_mm(struct mm_struct *mm)
 		struct anon_vma_chain *avc;
 
 		if (anon_vma) {
-			anon_vma_lock_read(anon_vma);
+			anon_vma_lock_write(anon_vma);
+			synchronize_ldu_anon(anon_vma);
 			list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
 				anon_vma_interval_tree_verify(avc);
-			anon_vma_unlock_read(anon_vma);
+			anon_vma_unlock_write(anon_vma);
 		}
 
 		highest_address = vma->vm_end;
@@ -537,6 +800,10 @@ static void vma_rb_erase(struct vm_area_struct *vma, struct rb_root *root)
 	rb_erase_augmented(&vma->vm_rb, root, &vma_gap_callbacks);
 }
 
+
+#include <linux/ldu.h>
+bool anon_vma_ldu_logical_insert(struct anon_vma_chain *avc, struct anon_vma *anon);
+bool anon_vma_ldu_logical_remove(struct anon_vma_chain *avc, struct anon_vma *anon);
 /*
  * vma has some anon_vma assigned, and is already inserted on that
  * anon_vma's interval trees.
@@ -557,7 +824,8 @@ anon_vma_interval_tree_pre_update_vma(struct vm_area_struct *vma)
 	struct anon_vma_chain *avc;
 
 	list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_remove(avc, &avc->anon_vma->rb_root);
+		anon_vma_ldu_logical_remove(avc, avc->anon_vma);
+//		anon_vma_interval_tree_remove(avc, &avc->anon_vma->rb_root);
 }
 
 static inline void
@@ -566,7 +834,8 @@ anon_vma_interval_tree_post_update_vma(struct vm_area_struct *vma)
 	struct anon_vma_chain *avc;
 
 	list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
+		anon_vma_ldu_logical_insert(avc, avc->anon_vma);
+//		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
 }
 
 static int find_vma_links(struct mm_struct *mm, unsigned long addr,
@@ -663,14 +932,17 @@ static void __vma_link_file(struct vm_area_struct *vma)
 	if (file) {
 		struct address_space *mapping = file->f_mapping;
 
+		flush_dcache_mmap_lock(mapping);
+		i_mmap_ldu_logical_insert(vma, mapping);
+		//pr_info("mapping : %lx\n", (long)mapping);
+		//vma_interval_tree_insert(vma, &mapping->i_mmap);
+		flush_dcache_mmap_unlock(mapping);
+
 		if (vma->vm_flags & VM_DENYWRITE)
 			atomic_dec(&file_inode(file)->i_writecount);
 		if (vma->vm_flags & VM_SHARED)
 			atomic_inc(&mapping->i_mmap_writable);
 
-		flush_dcache_mmap_lock(mapping);
-		vma_interval_tree_insert(vma, &mapping->i_mmap);
-		flush_dcache_mmap_unlock(mapping);
 	}
 }
 
@@ -689,16 +961,13 @@ static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 {
 	struct address_space *mapping = NULL;
 
-	if (vma->vm_file) {
+	if (vma->vm_file)
 		mapping = vma->vm_file->f_mapping;
-		i_mmap_lock_write(mapping);
-	}
 
 	__vma_link(mm, vma, prev, rb_link, rb_parent);
-	__vma_link_file(vma);
 
 	if (mapping)
-		i_mmap_unlock_write(mapping);
+		__vma_link_file(vma);
 
 	mm->map_count++;
 	validate_mm(mm);
@@ -734,6 +1003,7 @@ __vma_unlink(struct mm_struct *mm, struct vm_area_struct *vma,
 	/* Kill the cache */
 	vmacache_invalidate(mm);
 }
+
 
 /*
  * We cannot adjust vm_start, vm_end, vm_pgoff fields of a vma that
@@ -810,7 +1080,6 @@ again:			remove_next = 1 + (end > next->vm_end);
 		if (adjust_next)
 			uprobe_munmap(next, next->vm_start, next->vm_end);
 
-		i_mmap_lock_write(mapping);
 		if (insert) {
 			/*
 			 * Put into interval tree now, so instantiated pages
@@ -830,17 +1099,12 @@ again:			remove_next = 1 + (end > next->vm_end);
 	if (anon_vma) {
 		VM_BUG_ON_VMA(adjust_next && next->anon_vma &&
 			  anon_vma != next->anon_vma, next);
-		anon_vma_lock_write(anon_vma);
+		//anon_vma_lock_write(anon_vma);
+#if 1
 		anon_vma_interval_tree_pre_update_vma(vma);
 		if (adjust_next)
 			anon_vma_interval_tree_pre_update_vma(next);
-	}
-
-	if (root) {
-		flush_dcache_mmap_lock(mapping);
-		vma_interval_tree_remove(vma, root);
-		if (adjust_next)
-			vma_interval_tree_remove(next, root);
+#endif
 	}
 
 	if (start != vma->vm_start) {
@@ -855,13 +1119,6 @@ again:			remove_next = 1 + (end > next->vm_end);
 	if (adjust_next) {
 		next->vm_start += adjust_next << PAGE_SHIFT;
 		next->vm_pgoff += adjust_next;
-	}
-
-	if (root) {
-		if (adjust_next)
-			vma_interval_tree_insert(next, root);
-		vma_interval_tree_insert(vma, root);
-		flush_dcache_mmap_unlock(mapping);
 	}
 
 	if (remove_next) {
@@ -891,13 +1148,13 @@ again:			remove_next = 1 + (end > next->vm_end);
 	}
 
 	if (anon_vma) {
+#if 1
 		anon_vma_interval_tree_post_update_vma(vma);
 		if (adjust_next)
 			anon_vma_interval_tree_post_update_vma(next);
-		anon_vma_unlock_write(anon_vma);
+#endif
+		//anon_vma_unlock_write(anon_vma);
 	}
-	if (mapping)
-		i_mmap_unlock_write(mapping);
 
 	if (root) {
 		uprobe_mmap(vma);
@@ -915,7 +1172,7 @@ again:			remove_next = 1 + (end > next->vm_end);
 			anon_vma_merge(vma, next);
 		mm->map_count--;
 		mpol_put(vma_policy(next));
-		kmem_cache_free(vm_area_cachep, next);
+		free_vma(next);
 		/*
 		 * In mprotect's case 6 (see comments on vma_merge),
 		 * we must remove another next too. It would clutter
@@ -1605,6 +1862,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = pgoff;
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+	memset(&vma->dnode, 0, sizeof(vma->dnode));
 
 	if (file) {
 		if (vm_flags & VM_DENYWRITE) {
@@ -1695,7 +1953,7 @@ allow_write_and_free_vma:
 	if (vm_flags & VM_DENYWRITE)
 		allow_write_access(file);
 free_vma:
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(vma);
 unacct_error:
 	if (charged)
 		vm_unacct_memory(charged);
@@ -2238,9 +2496,10 @@ int expand_downwards(struct vm_area_struct *vma,
 	/*
 	 * vma->vm_start/vm_end cannot change under us because the caller
 	 * is required to hold the mmap_sem in read mode.  We need the
-	 * anon_vma lock to serialize against concurrent expand_stacks.
+	 * page_table_lock lock to serialize against concurrent expand_stacks.
 	 */
-	anon_vma_lock_write(vma->anon_vma);
+	//anon_vma_lock_write(vma->anon_vma);
+	spin_lock(&mm->page_table_lock);
 
 	/* Somebody else might have raced and expanded it already */
 	if (address < vma->vm_start) {
@@ -2253,18 +2512,6 @@ int expand_downwards(struct vm_area_struct *vma,
 		if (grow <= vma->vm_pgoff) {
 			error = acct_stack_growth(vma, size, grow);
 			if (!error) {
-				/*
-				 * vma_gap_update() doesn't support concurrent
-				 * updates, but we only hold a shared mmap_sem
-				 * lock here, so we need to protect against
-				 * concurrent vma expansions.
-				 * anon_vma_lock_write() doesn't help here, as
-				 * we don't guarantee that all growable vmas
-				 * in a mm share the same root anon vma.
-				 * So, we reuse mm->page_table_lock to guard
-				 * against concurrent vma expansions.
-				 */
-				spin_lock(&mm->page_table_lock);
 				if (vma->vm_flags & VM_LOCKED)
 					mm->locked_vm += grow;
 				vm_stat_account(mm, vma->vm_flags, grow);
@@ -2273,13 +2520,13 @@ int expand_downwards(struct vm_area_struct *vma,
 				vma->vm_pgoff -= grow;
 				anon_vma_interval_tree_post_update_vma(vma);
 				vma_gap_update(vma);
-				spin_unlock(&mm->page_table_lock);
 
 				perf_event_mmap(vma);
 			}
 		}
 	}
-	anon_vma_unlock_write(vma->anon_vma);
+	spin_unlock(&mm->page_table_lock);
+	//anon_vma_unlock_write(vma->anon_vma);
 	khugepaged_enter_vma_merge(vma, vma->vm_flags);
 	validate_mm(mm);
 	return error;
@@ -2454,7 +2701,7 @@ static int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 					~(huge_page_mask(hstate_vma(vma)))))
 		return -EINVAL;
 
-	new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+	new = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
 	if (!new)
 		return -ENOMEM;
 
@@ -2462,6 +2709,7 @@ static int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	*new = *vma;
 
 	INIT_LIST_HEAD(&new->anon_vma_chain);
+	memset(&new->dnode, 0, sizeof(new->dnode));
 
 	if (new_below)
 		new->vm_end = addr;
@@ -2503,7 +2751,7 @@ static int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
  out_free_mpol:
 	mpol_put(vma_policy(new));
  out_free_vma:
-	kmem_cache_free(vm_area_cachep, new);
+	free_vma(new);
 	return err;
 }
 
@@ -2800,6 +3048,7 @@ static unsigned long do_brk(unsigned long addr, unsigned long len)
 	}
 
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+	memset(&vma->dnode, 0, sizeof(vma->dnode));
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
 	vma->vm_end = addr + len;
@@ -2969,7 +3218,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		}
 		*need_rmap_locks = (new_vma->vm_pgoff <= vma->vm_pgoff);
 	} else {
-		new_vma = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+		new_vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
 		if (!new_vma)
 			goto out;
 		*new_vma = *vma;
@@ -2979,6 +3228,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		if (vma_dup_policy(vma, new_vma))
 			goto out_free_vma;
 		INIT_LIST_HEAD(&new_vma->anon_vma_chain);
+		memset(&new_vma->dnode, 0, sizeof(new_vma->dnode));
 		if (anon_vma_clone(new_vma, vma))
 			goto out_free_mempol;
 		if (new_vma->vm_file)
@@ -2993,7 +3243,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 out_free_mempol:
 	mpol_put(vma_policy(new_vma));
 out_free_vma:
-	kmem_cache_free(vm_area_cachep, new_vma);
+	free_vma(new_vma);
 out:
 	return NULL;
 }
@@ -3099,6 +3349,7 @@ static struct vm_area_struct *__install_special_mapping(
 		return ERR_PTR(-ENOMEM);
 
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+	memset(&vma->dnode, 0, sizeof(vma->dnode));
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
 	vma->vm_end = addr + len;
@@ -3120,7 +3371,7 @@ static struct vm_area_struct *__install_special_mapping(
 	return vma;
 
 out:
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(vma);
 	return ERR_PTR(ret);
 }
 
@@ -3265,7 +3516,7 @@ int mm_take_all_locks(struct mm_struct *mm)
 			list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
 				vm_lock_anon_vma(mm, avc->anon_vma);
 	}
-
+	anon_vma_global_lock();
 	return 0;
 
 out_unlock:
@@ -3321,6 +3572,7 @@ void mm_drop_all_locks(struct mm_struct *mm)
 	BUG_ON(down_read_trylock(&mm->mmap_sem));
 	BUG_ON(!mutex_is_locked(&mm_all_locks_mutex));
 
+	anon_vma_global_unlock();
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		if (vma->anon_vma)
 			list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
@@ -3454,3 +3706,36 @@ static int __meminit init_reserve_notifier(void)
 	return 0;
 }
 subsys_initcall(init_reserve_notifier);
+
+static int __init i_mmap_init_wq(void)
+{
+	int i, j;
+
+	i_mmap_wq = create_singlethread_workqueue("i_mmap");
+	WARN(!i_mmap_wq, "failed to create i_mmap workqueue\n");
+
+	pr_info("i_mmap work queue initialize");
+
+	free_vma_task = kthread_create(free_vma_thread, NULL, "mm_free_vma");
+	BUG_ON(IS_ERR(free_vma_task));
+	wake_up_process(free_vma_task);
+
+	for_each_possible_cpu(i) {
+		struct i_mmap_slot *slot;
+		struct llist_head *ll;
+
+		slot = &per_cpu(i_mmap_slot, i);
+
+		for (j = 0; j < I_MMAP_HASH_SIZE; j++) {
+			struct pldu_deferred_i_mmap *pldu = &slot->mapping[j];
+			init_llist_head(&pldu->list);
+		}
+
+		ll = &per_cpu(pldu_vma_clean, i);
+		init_llist_head(ll);
+
+	}
+
+	return 0;
+}
+__initcall(i_mmap_init_wq);

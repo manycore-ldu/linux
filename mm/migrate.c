@@ -839,8 +839,9 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	 * because that implies that the anon page is no longer mapped
 	 * (and cannot be remapped so long as we hold the page lock).
 	 */
-	if (PageAnon(page) && !PageKsm(page))
+	if (PageAnon(page) && !PageKsm(page)) {
 		anon_vma = page_get_anon_vma(page);
+	}
 
 	/*
 	 * Block others from accessing the new page when we get around to
@@ -889,6 +890,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 				page);
 		try_to_unmap(page,
 			TTU_MIGRATION|TTU_IGNORE_MLOCK|TTU_IGNORE_ACCESS);
+
 		page_was_mapped = 1;
 	}
 
@@ -1048,8 +1050,9 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 		lock_page(hpage);
 	}
 
-	if (PageAnon(hpage))
+	if (PageAnon(hpage)) {
 		anon_vma = page_get_anon_vma(hpage);
+	}
 
 	if (unlikely(!trylock_page(new_hpage)))
 		goto put_anon;
@@ -1684,6 +1687,8 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
 	int nr_remaining;
 	LIST_HEAD(migratepages);
 
+	if (PageAnon(page))
+		goto out;
 	/*
 	 * Don't migrate file pages that are mapped in multiple processes
 	 * with execute permissions as they are probably shared libraries.

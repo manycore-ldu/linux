@@ -3126,7 +3126,6 @@ static void freeze_page(struct anon_vma *anon_vma, struct page *page)
 	pgoff_t pgoff = page_to_pgoff(page);
 
 	VM_BUG_ON_PAGE(!PageHead(page), page);
-
 	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff,
 			pgoff + HPAGE_PMD_NR - 1) {
 		unsigned long address = __vma_address(page, avc->vma);
@@ -3386,6 +3385,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		goto out;
 	}
 	anon_vma_lock_write(anon_vma);
+	synchronize_ldu_anon(anon_vma->root);
 
 	/*
 	 * Racy check if we can split the page, before freeze_page() will
